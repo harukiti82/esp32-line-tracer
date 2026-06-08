@@ -151,7 +151,9 @@ bool setupCamera() {
   config.pin_vsync = CAM_VSYNC; config.pin_href  = CAM_HREF;
   config.pin_sccb_sda = CAM_SIOD; config.pin_sccb_scl = CAM_SIOC;
   config.pin_pwdn  = CAM_PWDN;  config.pin_reset = CAM_RESET;
-  config.xclk_freq_hz = 20000000;
+  // XIAO ESP32-S3 Sense はカメラFPCが長く、20MHzだとDMAが取りこぼして
+  // "FB-SIZE mismatch" を出すことがある。10MHzに落として確実に1フレーム取り切る。
+  config.xclk_freq_hz = 10000000;
   config.frame_size   = FRAMESIZE_QQVGA;      // 160x120: ライン検出には十分で軽い
   config.pixel_format = PIXFORMAT_GRAYSCALE;  // 明暗だけ見るのでグレースケール
 
@@ -174,6 +176,14 @@ bool setupCamera() {
     Serial.printf("カメラ初期化失敗: 0x%x\n", err);
     return false;
   }
+  // OV2640 は起動直後の数フレームが壊れている(FB-SIZE mismatch の一因)。
+  // 露出が安定するまで数枚読み捨てて、最初の lineTrace() に壊れたフレームを渡さない。
+  for (int i = 0; i < 5; i++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    delay(50);
+  }
+
   Serial.println("カメラ初期化OK (QQVGA grayscale)");
   return true;
 }
