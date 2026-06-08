@@ -11,6 +11,8 @@
 //    'l' … LINE   算出した左右%で自律走行。ライン消失で停止
 //    'r' … REMOTE 従来のUDPリモコンで駆動
 //    's' … 即停止して IDLE へ
+//    'c' … CALIB  床と線の輝度を実測してしきい値を自動較正(NVSに保存)
+//    'x' … 較正データを消去して適応しきい値に戻す
 //  ※どのモードでも検出処理は毎ループ走るので、車輪を回さず検証できる
 //
 //  対象ボード:   Seeed Studio XIAO ESP32-S3 Sense (ESP32-S3, 8MB PSRAM, OV2640)
@@ -21,6 +23,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ESP32Servo.h>
+#include <Preferences.h>     // 較正値を NVS に永続化(ESP32コア同梱、追加インストール不要)
 #include "esp_camera.h"
 
 // ---- WiFi 設定 -------------------------------------------------------------
@@ -86,6 +89,13 @@ const int   MAX_TURN     = 45;     // 旋回補正の上限(%)
 
 const unsigned long PRINT_INTERVAL_MS = 150;  // シリアル出力の間引き間隔
 
+// ---- キャリブレーション ----------------------------------------------------
+// 'c' で床と線の輝度を実測し、線の明暗としきい値を自動決定して NVS に保存する。
+// 未較正なら従来の適応しきい値(mean±LINE_MARGIN)で動く(後方互換)。
+const int CALIB_SAMPLE_FRAMES = 15;       // 各ステップで平均するフレーム数
+const int CALIB_MIN_SEP       = 25;       // 床と線の輝度差がこれ未満なら較正失敗(保存しない)
+const unsigned long CALIB_KEY_TIMEOUT_MS = 15000;  // キー入力待ちのタイムアウト
+
 // ---------------------------------------------------------------------------
 enum Mode { MODE_IDLE, MODE_LINE, MODE_REMOTE };
 
@@ -95,6 +105,14 @@ Servo   servoR;
 
 Mode g_mode = MODE_IDLE;                  // 既定は検証用IDLE(車輪を回さない)
 bool g_camOk = false;                     // カメラ初期化成否
+
+// ---- キャリブレーション結果(NVSに永続化) ---------------------------------
+Preferences g_prefs;
+bool g_calibrated    = false;             // 較正済みか(falseなら適応しきい値)
+bool g_calLineIsDark = LINE_IS_DARK;      // 較正で判定した線の明暗
+int  g_threshAbs     = 128;               // 較正で決めた絶対しきい値
+int  g_calFloorLv    = 0;                 // 較正時の床の輝度(参考表示用)
+int  g_calLineLv     = 0;                 // 較正時の線の輝度(参考表示用)
 
 // 現在のモーター出力(%) -100〜100。これが唯一の「真の出力値」。
 int g_leftPercent  = 0;
@@ -136,6 +154,133 @@ void setMotorPercent(int leftPct, int rightPct) {
 
 void stopMotor() {
   setMotorPercent(0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// キャリブレーション関連
+// ---------------------------------------------------------------------------
+
+// ROI帯の輝度統計(平均・最小・最大)を frames フレーム平均で求める。
+// 較正で「床の代表輝度」「線の代表輝度」を実測するために使う。
+struct RoiStat { int mean; int minV; int maxV; };
+
+RoiStat sampleRoiStat(int frames) {
+  long meanAcc = 0, minAcc = 0, maxAcc = 0;
+  int  got = 0;
+  for (int f = 0; f < frames; f++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { delay(20); continue; }
+    const int W = fb->width, H = fb->height;
+    const int rTop = (int)(H * ROI_TOP_R), rBot = (int)(H * ROI_BOT_R);
+    long sum = 0; int cnt = 0, mn = 255, mx = 0;
+    for (int y = rTop; y < rBot; y++) {
+      const uint8_t* row = fb->buf + (long)y * W;
+      for (int x = 0; x < W; x++) {
+        int v = row[x];
+        sum += v; cnt++;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+    }
+    esp_camera_fb_return(fb);
+    if (cnt) { meanAcc += sum / cnt; minAcc += mn; maxAcc += mx; got++; }
+    delay(20);
+  }
+  RoiStat s;
+  if (got) { s.mean = meanAcc / got; s.minV = minAcc / got; s.maxV = maxAcc / got; }
+  else     { s.mean = 128;          s.minV = 0;            s.maxV = 255; }
+  return s;
+}
+
+// シリアルに溜まった入力を捨ててから、1文字入力かタイムアウトまで待つ。
+// 戻り値: キーが押されたら true / タイムアウトなら false。
+bool waitKey(unsigned long timeoutMs) {
+  while (Serial.available()) Serial.read();   // 古い入力を捨てる
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (Serial.available()) { Serial.read(); return true; }
+    delay(10);
+  }
+  return false;
+}
+
+void saveCalibration() {
+  g_prefs.begin("linecal", false);
+  g_prefs.putBool("valid", true);
+  g_prefs.putInt ("thresh", g_threshAbs);
+  g_prefs.putBool("dark",   g_calLineIsDark);
+  g_prefs.putInt ("floor",  g_calFloorLv);
+  g_prefs.putInt ("line",   g_calLineLv);
+  g_prefs.end();
+}
+
+// 起動時に NVS から較正値を読む。無ければ適応しきい値で動く。
+void loadCalibration() {
+  g_prefs.begin("linecal", true);             // 読み取り専用
+  g_calibrated = g_prefs.getBool("valid", false);
+  if (g_calibrated) {
+    g_threshAbs     = g_prefs.getInt ("thresh", 128);
+    g_calLineIsDark = g_prefs.getBool("dark",  LINE_IS_DARK);
+    g_calFloorLv    = g_prefs.getInt ("floor", 0);
+    g_calLineLv     = g_prefs.getInt ("line",  0);
+  }
+  g_prefs.end();
+  if (g_calibrated) {
+    Serial.printf("較正データ読込: %s-line thresh=%d (floor=%d line=%d)\n",
+                  g_calLineIsDark ? "DARK" : "BRIGHT", g_threshAbs, g_calFloorLv, g_calLineLv);
+  } else {
+    Serial.println("較正データなし -> 適応しきい値(mean±LINE_MARGIN)で動作。'c'で較正");
+  }
+}
+
+void clearCalibration() {
+  g_prefs.begin("linecal", false);
+  g_prefs.putBool("valid", false);
+  g_prefs.end();
+  g_calibrated = false;
+  Serial.println(">> 較正データ消去 -> 適応しきい値に戻す");
+}
+
+// 床と線を実測してしきい値・線の明暗を自動決定する2ステップ較正。
+// モーターは停止し、車体を手で持ってカメラを向けながら操作する。
+void runCalibration() {
+  g_mode = MODE_IDLE;
+  stopMotor();
+  if (!g_camOk) { Serial.println("カメラNGのため較正できません"); return; }
+
+  Serial.println("=== キャリブレーション ===");
+  Serial.println("[1/2] カメラを『床だけ(線なし)』に向けて任意キー (15秒で中止)");
+  if (!waitKey(CALIB_KEY_TIMEOUT_MS)) { Serial.println("タイムアウトで中止(較正は変更なし)"); return; }
+  RoiStat fl = sampleRoiStat(CALIB_SAMPLE_FRAMES);
+  Serial.printf("  床   : mean=%d (min=%d max=%d)\n", fl.mean, fl.minV, fl.maxV);
+
+  Serial.println("[2/2] カメラを『線の上』に向けて任意キー");
+  if (!waitKey(CALIB_KEY_TIMEOUT_MS)) { Serial.println("タイムアウトで中止(較正は変更なし)"); return; }
+  RoiStat ln = sampleRoiStat(CALIB_SAMPLE_FRAMES);
+  Serial.printf("  線上 : mean=%d (min=%d max=%d)\n", ln.mean, ln.minV, ln.maxV);
+
+  // 床の代表輝度を基準に、線が「暗い側」か「明るい側」かを実測で判定する。
+  // 線が細くてもROIの min/max が線画素を拾うので、平均より頑健に明暗を見分けられる。
+  int floorLv       = fl.mean;
+  int darkContrast  = floorLv - ln.minV;      // 暗い線ならここが大きい
+  int brightContrast = ln.maxV - floorLv;     // 明るい線ならここが大きい
+  bool lineIsDark   = (darkContrast >= brightContrast);
+  int  lineLv       = lineIsDark ? ln.minV : ln.maxV;
+  int  sep          = abs(floorLv - lineLv);
+
+  if (sep < CALIB_MIN_SEP) {
+    Serial.printf("コントラスト不足(差=%d < %d)。照明や対象を見直して再実行(c)\n", sep, CALIB_MIN_SEP);
+    return;                                    // 保存しない(既存設定を維持)
+  }
+
+  g_calLineIsDark = lineIsDark;
+  g_threshAbs     = (floorLv + lineLv) / 2;    // 床と線の中間を絶対しきい値に
+  g_calFloorLv    = floorLv;
+  g_calLineLv     = lineLv;
+  g_calibrated    = true;
+  saveCalibration();
+  Serial.printf(">> 較正完了: %s-line floor=%d line=%d thresh=%d (NVS保存済)\n",
+                lineIsDark ? "DARK" : "BRIGHT", floorLv, lineLv, g_threshAbs);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +357,12 @@ LineResult lineTrace() {
   }
   int mean = cnt ? (int)(sum / cnt) : 128;
   r.bandMean = mean;
-  int thresh = LINE_IS_DARK ? (mean - LINE_MARGIN) : (mean + LINE_MARGIN);
+
+  // 較正済みなら実測した絶対しきい値を使う。未較正なら従来の適応しきい値。
+  bool lineIsDark = g_calibrated ? g_calLineIsDark : LINE_IS_DARK;
+  int  thresh     = g_calibrated ? g_threshAbs
+                                 : (LINE_IS_DARK ? (mean - LINE_MARGIN)
+                                                 : (mean + LINE_MARGIN));
 
   // 2) しきい値を超える(=線)画素の重心Xを求める
   long sx = 0;
@@ -220,7 +370,7 @@ LineResult lineTrace() {
   for (int y = rTop; y < rBot; y++) {
     const uint8_t* row = fb->buf + (long)y * W;
     for (int x = 0; x < W; x++) {
-      bool isLine = LINE_IS_DARK ? (row[x] < thresh) : (row[x] > thresh);
+      bool isLine = lineIsDark ? (row[x] < thresh) : (row[x] > thresh);
       if (isLine) { sx += x; px++; }
     }
   }
@@ -259,15 +409,20 @@ void printTelemetry(const LineResult& r) {
                       :                           "REMOTE";
   bool driving = (g_mode == MODE_LINE && r.detected);
 
+  // 較正の有効/無効を表示(較正済みは線の明暗と絶対しきい値も出す)
+  char calStr[24];
+  if (g_calibrated) snprintf(calStr, sizeof(calStr), "cal=%s@%d", g_calLineIsDark ? "DARK" : "BRT", g_threshAbs);
+  else              snprintf(calStr, sizeof(calStr), "cal=off");
+
   if (!g_camOk) {
     Serial.printf("[LINE] camera=NG  mode=%s\n", modeStr);
   } else if (r.detected) {
-    Serial.printf("[LINE] det=Y mean=%3d cx=%3d/%d err=%+4d px=%4d -> L=%+4d%% R=%+4d%% | mode=%s%s\n",
+    Serial.printf("[LINE] det=Y mean=%3d cx=%3d/%d err=%+4d px=%4d -> L=%+4d%% R=%+4d%% | %s mode=%s%s\n",
                   r.bandMean, r.centroidX, r.width, r.error, r.pixels,
-                  r.outL, r.outR, modeStr, driving ? " (駆動中)" : " (出力のみ)");
+                  r.outL, r.outR, calStr, modeStr, driving ? " (駆動中)" : " (出力のみ)");
   } else {
-    Serial.printf("[LINE] det=N mean=%3d px=%4d -- ライン消失 -- | mode=%s%s\n",
-                  r.bandMean, r.pixels, modeStr,
+    Serial.printf("[LINE] det=N mean=%3d px=%4d -- ライン消失 -- | %s mode=%s%s\n",
+                  r.bandMean, r.pixels, calStr, modeStr,
                   (g_mode == MODE_LINE) ? " -> 停止" : "");
   }
 }
@@ -282,6 +437,8 @@ void handleSerialCmd() {
       case 'r': g_mode = MODE_REMOTE; stopMotor(); g_lastCmdMs = millis();
                 Serial.println(">> モード: REMOTE (UDPリモコン)"); break;
       case 's': g_mode = MODE_IDLE;   stopMotor(); Serial.println(">> 停止 (IDLEへ)");                 break;
+      case 'c': runCalibration();     break;           // 床/線を実測して較正
+      case 'x': clearCalibration();   break;           // 較正データを消去
       default: break;                                  // 改行など無視
     }
   }
@@ -325,6 +482,7 @@ void setup() {
   stopMotor();                          // 起動時は必ず停止
 
   g_camOk = setupCamera();              // カメラ初期化(失敗してもリモコンは使える)
+  loadCalibration();                    // NVSから較正値を復元(無ければ適応しきい値)
 
   setupWiFi();
   udp.begin(UDP_PORT);
@@ -333,6 +491,7 @@ void setup() {
 
   Serial.println("------------------------------------------------------------");
   Serial.println("操作: i=IDLE(検証) / l=LINE(自律) / r=REMOTE(UDP) / s=停止");
+  Serial.println("      c=較正(床→線を撮る) / x=較正消去");
   Serial.println("既定は IDLE。線を見せれば検出ログが出るが車輪は回りません。");
   Serial.println("------------------------------------------------------------");
 
