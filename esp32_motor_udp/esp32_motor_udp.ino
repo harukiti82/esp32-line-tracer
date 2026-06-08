@@ -344,7 +344,8 @@ void printMotorCal(int testPct) {
 }
 
 // 車輪を浮かせた状態で左右バランス・中立をライブ調整して NVS に保存する。
-// w/s:両輪テスト速度 / space:停止 / a,d:左右バランス / j,k:中立トリム /
+// w/s:両輪テスト速度 / space:停止 / a,d:左右バランス /
+// j,k:左中立-+ / n,m:右中立-+ (左右独立。0%で各輪が止まるよう個別に合わせる) /
 // r:既定に戻す / p:現在値 / v:保存して終了 / q:破棄して終了
 // ※Arduinoシリアルモニタは改行でまとめて送るため、改行(\r\n)は無視扱いにして
 //   保存は明示キー'v'にしている(改行あり/なしどちらの設定でも単キー操作が壊れない)。
@@ -352,7 +353,7 @@ void runMotorCalibration() {
   g_mode = MODE_IDLE;
   Serial.println("=== モーターゲイン較正 (車輪を浮かせて実施) ===");
   Serial.println(" w/s:両輪テスト速度+- / space:停止 / a:左を強く d:右を強く");
-  Serial.println(" j,k:中立トリム / r:既定に戻す / p:現在値 / v:保存して終了 / q:破棄");
+  Serial.println(" j/k:左中立-+ / n/m:右中立-+ / r:既定 / p:現在値 / v:保存 / q:破棄");
 
   // 破棄に備えて開始時の値を退避
   float bkGainL = g_gainL, bkGainR = g_gainR;
@@ -373,10 +374,10 @@ void runMotorCalibration() {
                 g_gainL = constrain(g_gainL - 0.02f, 0.5f, 1.5f); break;  // 右を強く
       case 'a': g_gainL = constrain(g_gainL + 0.02f, 0.5f, 1.5f);
                 g_gainR = constrain(g_gainR - 0.02f, 0.5f, 1.5f); break;  // 左を強く
-      case 'j': g_midL = constrain(g_midL - 2, 1400, 1600);
-                g_midR = constrain(g_midR + 2, 1400, 1600); break;       // 中立トリム
-      case 'k': g_midL = constrain(g_midL + 2, 1400, 1600);
-                g_midR = constrain(g_midR - 2, 1400, 1600); break;
+      case 'j': g_midL = constrain(g_midL - 2, 1400, 1600); break;       // 左中立 -
+      case 'k': g_midL = constrain(g_midL + 2, 1400, 1600); break;       // 左中立 +
+      case 'n': g_midR = constrain(g_midR - 2, 1400, 1600); break;       // 右中立 -
+      case 'm': g_midR = constrain(g_midR + 2, 1400, 1600); break;       // 右中立 +
       case 'r': g_gainL = g_gainR = 1.0f; g_midL = g_midR = SERVO_MID_US;
                 testPct = 0; Serial.println("  既定に戻した"); break;
       case 'p': break;                                  // 現在値を表示するだけ
