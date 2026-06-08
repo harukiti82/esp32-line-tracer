@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>ライントレース用 印刷コース (A4タイル)</title>
+<style>
+  /* A4・原寸印刷用。ブラウザの印刷で「倍率100% / 余白なし」にすること。 */
+  @page { size: A4 portrait; margin: 0; }
+  html, body { margin: 0; padding: 0; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  .page {
+    position: relative;
+    width: 210mm;
+    height: 297mm;
+    page-break-after: always;
+    overflow: hidden;
+    box-sizing: border-box;
+    font-family: "Hiragino Sans", "Yu Gothic", sans-serif;
+  }
+  .page:last-child { page-break-after: auto; }
+
+  /* タイル(200mm四方のSVG)をA4中央に置く */
+  .tile {
+    position: absolute;
+    left: 5mm;   /* (210-200)/2 */
+    top: 48.5mm; /* (297-200)/2 */
+  }
+
+  .note {
+    position: absolute;
+    left: 12mm; top: 8mm; right: 12mm;
+    font-size: 10pt; line-height: 1.6; color: #222;
+  }
+  .note h1 { font-size: 15pt; margin: 0 0 6px; }
+  .note h2 { font-size: 12pt; margin: 14px 0 4px; }
+  .tile-label {
+    position: absolute; left: 0; right: 0; bottom: 14mm;
+    text-align: center; font-size: 11pt; color: #444;
+  }
+
+  @media screen {
+    body { background: #ddd; }
+    .page { background: #fff; margin: 12px auto; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+  }
+</style>
+</head>
+<body>
+
+<!-- ===== 1枚目: 説明 + 原寸チェック定規 ===== -->
+<div class="page">
+  <div class="note">
+    <h1>ライントレース用 印刷コース（A4タイル）</h1>
+    白地に黒線（ファームの <code>LINE_IS_DARK = true</code> 用）。線幅 30mm。<br>
+    タイルは 180mm 角。線は各辺の中央を通るので、タイル同士を辺で突き合わせると線がつながる。
+
+    <h2>① 必ず原寸で印刷</h2>
+    印刷ダイアログで <b>倍率 100%（「用紙に合わせる」は OFF）</b>、余白なし。<br>
+    印刷後、下の定規が <b>ちょうど 100mm</b> なら原寸。ずれていたら倍率を直して再印刷。
+
+    <h2>② 切る</h2>
+    各タイルの <b>外周の破線</b>（180mm 角）で切る。四隅のトンボを目印に。
+
+    <h2>③ つなぐ</h2>
+    切った辺同士をぴったり突き合わせ、<b>裏からテープ</b>で留める（表に黒いテープを出さない）。<br>
+    最小の周回コース = <b>カーブ4枚を 2×2</b> に並べる（円形の輪）。直線タイルを挟めば長くできる。<br>
+    タイルは正方形なので、紙を回して向きを合わせる（直線は縦横どちらにも、カーブは4方向に）。
+
+    <h2>④ 走らせる</h2>
+    床に平らに敷く（浮き・影は誤検出のもと）。シリアルに <code>i</code> で検出確認 → <code>l</code> で走行。<br>
+    線を拾わない/フラつくときは、ファームの <code>LINE_MARGIN</code>・<code>KP</code>・<code>BASE_SPEED</code> を調整。
+  </div>
+
+  <!-- 原寸チェック定規(100mm) -->
+  <svg class="tile" width="200mm" height="200mm" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <text x="100" y="142" font-size="6" text-anchor="middle" fill="#000">↓ この目盛りが 100mm なら原寸 ↓</text>
+    <g stroke="#000" stroke-width="0.4">
+      <line x1="50" y1="152" x2="150" y2="152"/>
+      <!-- 10mm ごとの目盛り -->
+      <line x1="50"  y1="146" x2="50"  y2="158"/>
+      <line x1="60"  y1="150" x2="60"  y2="154"/>
+      <line x1="70"  y1="150" x2="70"  y2="154"/>
+      <line x1="80"  y1="150" x2="80"  y2="154"/>
+      <line x1="90"  y1="150" x2="90"  y2="154"/>
+      <line x1="100" y1="148" x2="100" y2="156"/>
+      <line x1="110" y1="150" x2="110" y2="154"/>
+      <line x1="120" y1="150" x2="120" y2="154"/>
+      <line x1="130" y1="150" x2="130" y2="154"/>
+      <line x1="140" y1="150" x2="140" y2="154"/>
+      <line x1="150" y1="146" x2="150" y2="158"/>
+    </g>
+    <text x="50"  y="168" font-size="5" text-anchor="middle" fill="#000">0</text>
+    <text x="100" y="168" font-size="5" text-anchor="middle" fill="#000">50mm</text>
+    <text x="150" y="168" font-size="5" text-anchor="middle" fill="#000">100mm</text>
+  </svg>
+</div>
+
+<!-- ===== 2枚目: 直線タイル ===== -->
+<div class="page">
+  <svg class="tile" width="200mm" height="200mm" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <!-- 切り取り外周(180mm角: 10..190) -->
+    <rect x="10" y="10" width="180" height="180" fill="none" stroke="#aaa" stroke-width="0.3" stroke-dasharray="3 3"/>
+    <!-- 四隅トンボ -->
+    <g stroke="#000" stroke-width="0.4">
+      <line x1="10" y1="4"  x2="10" y2="10"/>  <line x1="4"  y1="10" x2="10" y2="10"/>
+      <line x1="190" y1="4" x2="190" y2="10"/> <line x1="196" y1="10" x2="190" y2="10"/>
+      <line x1="10" y1="196" x2="10" y2="190"/> <line x1="4" y1="190" x2="10" y2="190"/>
+      <line x1="190" y1="196" x2="190" y2="190"/> <line x1="196" y1="190" x2="190" y2="190"/>
+    </g>
+    <!-- 線(辺中央 x=100 を縦断、幅30mm) -->
+    <line x1="100" y1="10" x2="100" y2="190" stroke="#000" stroke-width="30" stroke-linecap="butt"/>
+    <!-- 接続点マーク(辺中央) -->
+    <g fill="#888"><circle cx="100" cy="10" r="1.2"/><circle cx="100" cy="190" r="1.2"/></g>
+  </svg>
+  <div class="tile-label">直線タイル（必要枚数を印刷。縦横は紙を回して使う）</div>
+</div>
+
+<!-- ===== 3枚目: 90°カーブタイル ===== -->
+<div class="page">
+  <svg class="tile" width="200mm" height="200mm" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <rect x="10" y="10" width="180" height="180" fill="none" stroke="#aaa" stroke-width="0.3" stroke-dasharray="3 3"/>
+    <g stroke="#000" stroke-width="0.4">
+      <line x1="10" y1="4"  x2="10" y2="10"/>  <line x1="4"  y1="10" x2="10" y2="10"/>
+      <line x1="190" y1="4" x2="190" y2="10"/> <line x1="196" y1="10" x2="190" y2="10"/>
+      <line x1="10" y1="196" x2="10" y2="190"/> <line x1="4" y1="190" x2="10" y2="190"/>
+      <line x1="190" y1="196" x2="190" y2="190"/> <line x1="196" y1="190" x2="190" y2="190"/>
+    </g>
+    <!-- 上辺中央(100,10) → 右辺中央(190,100) の1/4円(半径90, 中心=右上角190,10) -->
+    <path d="M 100 10 A 90 90 0 0 0 190 100" fill="none" stroke="#000" stroke-width="30" stroke-linecap="butt"/>
+    <g fill="#888"><circle cx="100" cy="10" r="1.2"/><circle cx="190" cy="100" r="1.2"/></g>
+  </svg>
+  <div class="tile-label">90°カーブタイル（向きは紙を回して合わせる。曲線半径 90mm = やや急。低速で）</div>
+</div>
+
+</body>
+</html>
