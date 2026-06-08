@@ -653,35 +653,34 @@ void setup() {
 // UDP受信: "L,R"(例 "50,50") または 単一値 "V"(両輪同値) を受け取る。
 // REMOTEモードのときだけモーターに反映する。
 void handleUdp() {
-  int packetSize = udp.parsePacket();
-  if (packetSize <= 0) return;
+  // 溜まったパケットを毎回すべて吸い出す。1ループ1パケットだとキープアライブや
+  // 連打でキューが溜まり、古い指令が遅れて効いて不安定になるため、最新まで読み切る。
+  while (udp.parsePacket() > 0) {
+    int len = udp.read(rxBuf, sizeof(rxBuf) - 1);
+    if (len <= 0) continue;
+    rxBuf[len] = '\0';
 
-  int len = udp.read(rxBuf, sizeof(rxBuf) - 1);
-  if (len <= 0) return;
-  rxBuf[len] = '\0';
+    int l = 0, r = 0;
+    if (sscanf(rxBuf, "%d,%d", &l, &r) == 2) {
+      // 左右独立
+    } else if (sscanf(rxBuf, "%d", &l) == 1) {
+      r = l;                             // 単一値は両輪同値
+    } else {
+      continue;                          // 解釈不能なパケットは無視
+    }
 
-  int l = 0, r = 0;
-  int parsed;
-  if (sscanf(rxBuf, "%d,%d", &l, &r) == 2) {
-    parsed = 2;
-  } else if (sscanf(rxBuf, "%d", &l) == 1) {
-    r = l;                               // 単一値は両輪同値
-    parsed = 1;
-  } else {
-    return;                              // 解釈不能なパケットは無視
-  }
-
-  g_lastCmdMs = millis();
-  if (g_mode == MODE_REMOTE) {
-    setMotorPercent(l, r);
-    Serial.printf("RX: \"%s\" -> L=%d%% R=%d%%\n", rxBuf, g_leftPercent, g_rightPercent);
-  } else if (g_mode == MODE_LINE) {
-    // LINE中は左右値の平均を基準速度として採用(0〜100にクランプ)。
-    // キープアライブで同値が再送され続けるので、変化したときだけ反映・表示する。
-    int base = constrain((l + r) / 2, 0, 100);
-    if (base != g_baseSpeed) {
-      g_baseSpeed = base;
-      Serial.printf("RX: \"%s\" -> LINE基準速度=%d%%\n", rxBuf, g_baseSpeed);
+    g_lastCmdMs = millis();
+    if (g_mode == MODE_REMOTE) {
+      setMotorPercent(l, r);
+      Serial.printf("RX: \"%s\" -> L=%d%% R=%d%%\n", rxBuf, g_leftPercent, g_rightPercent);
+    } else if (g_mode == MODE_LINE) {
+      // LINE中は左右値の平均を基準速度として採用(0〜100にクランプ)。
+      // キープアライブで同値が再送され続けるので、変化したときだけ反映・表示する。
+      int base = constrain((l + r) / 2, 0, 100);
+      if (base != g_baseSpeed) {
+        g_baseSpeed = base;
+        Serial.printf("RX: \"%s\" -> LINE基準速度=%d%%\n", rxBuf, g_baseSpeed);
+      }
     }
   }
 }
@@ -693,20 +692,22 @@ void loop() {
   // --- 制御ソース1: UDPリモコン (REMOTEモードのみ駆動) -------------------
   handleUdp();
 
-  // --- 制御ソース2: ライントレース(検出は常時、駆動はLINEモードのみ) ----
-  LineResult lr = lineTrace();
-  if (g_mode == MODE_LINE) {
-    if (lr.detected) {
-      setMotorPercent(lr.outL, lr.outR);
-    } else {
-      stopMotor();                       // ライン消失で停止
+  // --- 制御ソース2: ライントレース -------------------------------------
+  // REMOTE中はカメラを回さない。カメラ取り込みでループが伸びる/止まると
+  // UDP応答が遅れ、フェイルセーフ誤発火でガクつくため、リモコン時は無効化する。
+  if (g_mode != MODE_REMOTE) {
+    LineResult lr = lineTrace();
+    if (g_mode == MODE_LINE) {
+      if (lr.detected) {
+        setMotorPercent(lr.outL, lr.outR);
+      } else {
+        stopMotor();                     // ライン消失で停止
+      }
+    } else {                             // IDLE: 検証専用、車輪は回さない
+      stopMotor();
     }
-  } else if (g_mode == MODE_IDLE) {
-    stopMotor();                          // 検証専用: 車輪は回さない
+    printTelemetry(lr);                  // 検出結果をシリアルに出力
   }
-
-  // --- 検出結果をシリアルに出力(動作確認の本体) -------------------------
-  printTelemetry(lr);
 
   // --- フェイルセーフ: REMOTEで指令が途切れたら停止 ---------------------
   if (g_mode == MODE_REMOTE && millis() - g_lastCmdMs > FAILSAFE_MS) {
