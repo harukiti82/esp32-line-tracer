@@ -14,6 +14,11 @@
 //    s / Space -> 即停止(0%)
 //    ↑ / ↓     -> 両輪を ±5% 微調整して即送信
 //
+//  モード切替（ESP32へUDPで送信。シリアル接続不要）:
+//    l -> LINE  (自律走行。数値を送ると巡航速度=左右平均が変わる)
+//    r -> REMOTE(UDPリモコン。数値が左右モーター出力そのものになる)
+//    i -> IDLE  (停止して待機)
+//
 //  ※ESP32側のモードで送信値の意味が変わる:
 //    REMOTE -> 左右モーター出力そのもの / LINE -> 自律走行の基準速度(左右平均)
 //
@@ -38,6 +43,7 @@ int    leftPct  = 0;                 // 現在の左出力(%)
 int    rightPct = 0;                 // 現在の右出力(%)
 int    lastSendMs = 0;
 String lastSent = "";                // 直近送信文字列(再送用)
+String currentMode = "?";            // 最後に送ったモード(画面表示用。受信はしないので参考値)
 
 PFont  fontBig, fontMid, fontSmall;
 
@@ -63,6 +69,11 @@ void draw() {
   textFont(fontSmall);
   textAlign(LEFT, TOP);
   text("ESP32 " + ESP32_IP + ":" + ESP32_PORT, 16, 12);
+
+  // 最後に送ったモードを右上に表示(ESP32からは受信しないので「送った値」)
+  textAlign(RIGHT, TOP);
+  fill(200, 180, 120);
+  text("MODE: " + currentMode, width - 16, 12);
 
   // --- 出力% 大表示 ---
   textAlign(CENTER, CENTER);
@@ -91,7 +102,7 @@ void draw() {
   textFont(fontSmall);
   fill(110, 130, 150);
   textAlign(LEFT, TOP);
-  text("Enter:送信  s/Space:停止  ↑↓:±5%  例 \"50\" or \"50,30\"", 16, 392);
+  text("Enter:送信 s/Space:停止 ↑↓:±5%  l:LINE r:REMOTE i:IDLE  例 \"50\"", 16, 392);
 
   // --- キープアライブ再送（フェイルセーフが切れないように）---
   if (millis() - lastSendMs > KEEPALIVE_MS && lastSent.length() > 0) {
@@ -131,6 +142,12 @@ void keyPressed() {
     leftPct = 0; rightPct = 0;
     inputBuf = "";
     send(0, 0);
+  } else if (key == 'l' || key == 'L') {
+    switchMode("LINE",   "l");              // 自律走行モードへ
+  } else if (key == 'r' || key == 'R') {
+    switchMode("REMOTE", "r");              // UDPリモコンモードへ
+  } else if (key == 'i' || key == 'I') {
+    switchMode("IDLE",   "i");              // 停止して待機
   } else if (key == CODED) {
     if (keyCode == UP) {
       send(constrain(leftPct + 5, -100, 100), constrain(rightPct + 5, -100, 100));
@@ -168,6 +185,31 @@ void send(int l, int r) {
   leftPct  = constrain(l, -100, 100);
   rightPct = constrain(r, -100, 100);
   sendRaw(leftPct + "," + rightPct);
+}
+
+// モードを切り替える。切替時は速度を必ず0に中立化してから送る——
+// 切替直後にキープアライブが直前の速度を送り続けると、REMOTEに入った瞬間に
+// 前回値で走り出して危険なため。0,0にしておけば両モードとも停止状態で始まる。
+void switchMode(String label, String cmd) {
+  currentMode = label;
+  leftPct = 0; rightPct = 0;
+  inputBuf = "";
+  sendCmd(cmd);     // モード切替(キープアライブは汚さない)
+  send(0, 0);       // 速度を0に中立化(以後のキープアライブも"0,0"になる)
+}
+
+// モード切替などの単発コマンドを送る。キープアライブ(lastSent/lastSendMs)は
+// 触らない —— ここを上書きすると REMOTE時の速度再送が止まり、ESP32側の
+// フェイルセーフ(500ms)が誤発火して停止してしまうため。UDP欠落に備え数回送る。
+void sendCmd(String msg) {
+  if (socket == null || espAddr == null) return;
+  try {
+    byte[] data = msg.getBytes();
+    DatagramPacket pkt = new DatagramPacket(data, data.length, espAddr, ESP32_PORT);
+    for (int i = 0; i < 3; i++) socket.send(pkt);
+  } catch (Exception e) {
+    println("コマンド送信失敗: " + e.getMessage());
+  }
 }
 
 // 文字列をそのままUDP送信（再送・キープアライブ共用）

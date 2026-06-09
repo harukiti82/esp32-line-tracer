@@ -660,6 +660,23 @@ void handleUdp() {
     if (len <= 0) continue;
     rxBuf[len] = '\0';
 
+    // 先頭が英字なら「モード切替コマンド」。Processing から数値指令("L,R")とは
+    // 別系統でモードを切り替えられるようにする(シリアル接続なしで操作可能)。
+    //   'l'=LINE(自律) / 'r'=REMOTE(UDPリモコン) / 'i','s'=IDLE(停止)
+    char cmd = rxBuf[0];
+    if (cmd == 'l' || cmd == 'L' || cmd == 'r' || cmd == 'R' ||
+        cmd == 'i' || cmd == 'I' || cmd == 's' || cmd == 'S') {
+      g_lastCmdMs = millis();
+      if (cmd == 'l' || cmd == 'L') {
+        g_mode = MODE_LINE;   Serial.println(">> [UDP]モード: LINE (自律走行)");
+      } else if (cmd == 'r' || cmd == 'R') {
+        g_mode = MODE_REMOTE; stopMotor(); Serial.println(">> [UDP]モード: REMOTE (UDPリモコン)");
+      } else {
+        g_mode = MODE_IDLE;   stopMotor(); Serial.println(">> [UDP]モード: IDLE (停止)");
+      }
+      continue;
+    }
+
     int l = 0, r = 0;
     if (sscanf(rxBuf, "%d,%d", &l, &r) == 2) {
       // 左右独立
