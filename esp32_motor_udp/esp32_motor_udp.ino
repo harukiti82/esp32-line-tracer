@@ -566,7 +566,12 @@ void handleSerialCmd() {
 void setupWiFi() {
   if (USE_SOFTAP) {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
+    // チャンネルを固定し、同時接続を1台に絞る(2.4GHz混雑時の安定化)。
+    // 第3引数=チャンネル(1/6/11が干渉少)、第4引数=ステルス、第5引数=最大接続数。
+    WiFi.softAP(AP_SSID, AP_PASS, 6, 0, 1);
+    // モデムスリープを無効化。省電力でRFが間欠停止すると、UDP取りこぼしや
+    // クライアント切断の一因になる。電源に余裕があるなら常時ONが安定する。
+    WiFi.setSleep(false);
     Serial.print("SoftAP起動: SSID=");
     Serial.println(AP_SSID);
     Serial.print("ESP32 IP : ");
