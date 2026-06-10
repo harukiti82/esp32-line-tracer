@@ -66,6 +66,14 @@ const int SERVO_MID_US = 1500;            // 中立(停止)
 //   BASE_SPEED を上げて合わせること(同じ%でも振り幅が小さくなるため)。
 const int SPEED_RANGE  = 200;
 
+// モーターの不感帯補正(中立付近で回り出さない分の最小パルス幅, us)。
+// 静止摩擦+ESC不感帯で、左15%/右20%以下ではモーターが回らなかったため、
+// 非ゼロ指令時は1%でもこの幅だけ中立から離して「回り出す最小点」を底上げする。
+// 実測: 左15%×SPEED_RANGE(200)=30us / 右20%×200=40us。左右個体差で別値にする。
+//   ・低速で回り出さないなら増やす / 1%でいきなり動きすぎるなら減らす
+const int DEADBAND_L_US = 30;             // 左モーターの不感帯(us)
+const int DEADBAND_R_US = 40;             // 右モーターの不感帯(us)
+
 // ---- フェイルセーフ(REMOTEモードのみ) -------------------------------------
 const unsigned long FAILSAFE_MS = 500;    // この時間UDPが来なければ停止
 
@@ -168,12 +176,23 @@ struct RoiStat { int mean; int minV; int maxV; };
 // ---------------------------------------------------------------------------
 // 指定した左右の出力(%)でモーターを駆動する。
 // 制御ソース(UDPリモコン / ライントレース)を問わず、最終的にここを通す。
+// %(-100..100)を中立からの振り幅(us, 符号付き)に変換する。
+// 0%は完全停止(0)。非ゼロは最小deadUsから最大SPEED_RANGEまで線形に割り当て、
+// 中立付近で回り出さない不感帯を1%でも飛び越えるようにする。
+int percentToSwing(int pct, int deadUs) {
+  if (pct == 0) return 0;
+  int mag   = abs(pct);                                              // 1..100
+  int swing = deadUs + (int)((long)(SPEED_RANGE - deadUs) * mag / 100);
+  return (pct > 0) ? swing : -swing;
+}
+
 void setMotorPercent(int leftPct, int rightPct) {
   g_leftPercent  = constrain(leftPct,  -100, 100);
   g_rightPercent = constrain(rightPct, -100, 100);
 
-  int lSpeed = map(g_leftPercent,  -100, 100, -SPEED_RANGE, SPEED_RANGE);
-  int rSpeed = map(g_rightPercent, -100, 100, -SPEED_RANGE, SPEED_RANGE);
+  // 不感帯補正込みで%→振り幅(us)に変換(左右別の不感帯を適用)
+  int lSpeed = percentToSwing(g_leftPercent,  DEADBAND_L_US);
+  int rSpeed = percentToSwing(g_rightPercent, DEADBAND_R_US);
 
   // 回転方向の反転フラグを適用(タイヤが逆回転するときはフラグで直す)
   if (INVERT_L) lSpeed = -lSpeed;
