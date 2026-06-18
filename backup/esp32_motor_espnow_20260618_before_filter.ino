@@ -116,10 +116,6 @@ const float KD = 0.5f;
 // 曲がりきれず消失停止するため)。直線では減速もしないので直線速度は犠牲にしない。
 // 大きすぎると緩いカーブの追従が鈍るので小さめにする。
 const float STEER_DEADZONE = 0.05f;
-// 重心(誤差)のローパスフィルタ係数(指数移動平均, 0<A<=1)。カメラのフレーム毎の重心
-// ノイズを平滑化し、P項・D項の震え(直線蛇行)を根本から抑える。小さいほど強く平滑化
-// するが応答が遅れる(カーブで反応遅れ→消失方向)。1.0でフィルタなし(従来動作)。
-const float NORM_FILT_A = 0.5f;
 
 const unsigned long PRINT_INTERVAL_MS = 150;  // シリアル出力の間引き間隔
 
@@ -174,7 +170,6 @@ int g_baseSpeed = BASE_SPEED;
 unsigned long g_lastCmdMs   = 0;          // 最後に有効な指令を受けた時刻
 unsigned long g_lastPrintMs = 0;          // 最後にテレメトリを出した時刻
 float g_prevNorm = 0.0f;                   // 前フレームの正規化誤差(PD制御の微分項用)
-float g_normFilt = 0.0f;                    // ローパス後の正規化誤差(フィルタ状態を保持)
 
 // ライン検出の1フレーム結果(シリアルに出してライントレースの動作を確認する)
 struct LineResult {
@@ -547,7 +542,6 @@ LineResult lineTrace() {
     r.error     = 0;
     r.outL = r.outR = 0;
     g_prevNorm  = 0.0f;           // 消失中は微分項をリセット(再検出時の急操舵を防ぐ)
-    g_normFilt  = 0.0f;           // フィルタ状態もリセット(再検出時に古い値を引きずらない)
     return r;
   }
 
@@ -556,10 +550,7 @@ LineResult lineTrace() {
   r.centroidX = (int)(sx / px);
   r.error     = r.centroidX - W / 2;            // 右にずれていれば +
 
-  float rawNorm = (float)r.error / (W / 2.0f);  // -1..1(生の正規化誤差)
-  // 重心ノイズをローパスで平滑化(直線蛇行の根本対策)。P項・D項の入力を安定させる。
-  g_normFilt = NORM_FILT_A * rawNorm + (1.0f - NORM_FILT_A) * g_normFilt;
-  float norm = g_normFilt;
+  float norm = (float)r.error / (W / 2.0f);     // -1..1
   // 直線の微小ノイズによる蛇行を抑えるソフト不感帯。中央付近は直進扱い(操舵0)、
   // 境界を超えたら不感帯分を差し引いた値で滑らかに操舵を立ち上げる。これによりカーブ
   // 入口でいきなり大舵にならず、反応遅れによる消失停止を防ぐ。norm=0のときは P項・
