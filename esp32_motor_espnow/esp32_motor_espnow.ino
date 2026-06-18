@@ -102,6 +102,10 @@ const float ROI_BOT_R    = 0.95f;  // ROI の下端 (画像高さ比)
 const int   BASE_SPEED   = 30;     // 直進時の基本速度(%)
 const float KP           = 0.9f;   // P制御ゲイン(誤差→旋回量)
 const int   MAX_TURN     = 45;     // 旋回補正の上限(%)
+// コーナー自動減速: 誤差|norm|(0..1)が大きい急カーブほど基準速度を一時的に落とす。
+// 0=減速なし。0.6なら最大舵角時に base を (1-0.6)=40% まで落とす。直線では据え置き。
+// 高速(BPM180+)でコーナーを曲がりきれず脱線する問題への対策。下げ過ぎると失速。
+const float CORNER_SLOWDOWN = 0.6f;
 
 const unsigned long PRINT_INTERVAL_MS = 150;  // シリアル出力の間引き間隔
 
@@ -535,11 +539,23 @@ LineResult lineTrace() {
   r.error     = r.centroidX - W / 2;            // 右にずれていれば +
 
   float norm = (float)r.error / (W / 2.0f);     // -1..1
+  float aerr = fabsf(norm);                     // 0..1 コーナーの曲率指標(大きいほど急)
   int   turn = (int)(KP * norm * 100.0f);
   turn = constrain(turn, -MAX_TURN, MAX_TURN);
+
+  // コーナー自動減速: 急カーブ(aerr大)ほど基準速度を一時的に落として曲がりやすくする。
+  // 直線(aerr≈0)では g_baseSpeed 据え置きなので直線速度は犠牲にしない。
+  int base = (int)(g_baseSpeed * (1.0f - CORNER_SLOWDOWN * aerr));
+
   // 線が右(error>0)なら右へ曲がる: 左を上げ・右を下げる
-  r.outL = constrain(g_baseSpeed + turn, -100, 100);
-  r.outR = constrain(g_baseSpeed - turn, -100, 100);
+  int outL = base + turn;
+  int outR = base - turn;
+  // 外輪飽和補償: 外輪が100で頭打ちになると左右差(=旋回の鋭さ)が削られて曲がりきれない。
+  // 100を超えた分を反対輪(内輪)から追加で引き、意図した左右差 2*turn を保つ。
+  if (outL > 100) { outR -= (outL - 100); outL = 100; }
+  if (outR > 100) { outL -= (outR - 100); outR = 100; }
+  r.outL = constrain(outL, -100, 100);
+  r.outR = constrain(outR, -100, 100);
   return r;
 }
 
