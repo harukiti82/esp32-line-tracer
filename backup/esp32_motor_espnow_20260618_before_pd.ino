@@ -106,10 +106,6 @@ const int   MAX_TURN     = 45;     // 旋回補正の上限(%)
 // 0=減速なし。0.6なら最大舵角時に base を (1-0.6)=40% まで落とす。直線では据え置き。
 // 高速(BPM180+)でコーナーを曲がりきれず脱線する問題への対策。下げ過ぎると失速。
 const float CORNER_SLOWDOWN = 0.6f;
-// PD制御の微分ゲイン。誤差の変化(縮まる速さ)に比例して操舵を弱め、高速時の
-// 蛇行(オーバーシュート)を制動する。0=従来のP制御のみ。大きすぎるとカメラ
-// ノイズに過敏になり逆に震えるので、まず KP の半分前後から現場調整する。
-const float KD = 0.5f;
 
 const unsigned long PRINT_INTERVAL_MS = 150;  // シリアル出力の間引き間隔
 
@@ -163,7 +159,6 @@ int g_rightPercent = 0;
 int g_baseSpeed = BASE_SPEED;
 unsigned long g_lastCmdMs   = 0;          // 最後に有効な指令を受けた時刻
 unsigned long g_lastPrintMs = 0;          // 最後にテレメトリを出した時刻
-float g_prevNorm = 0.0f;                   // 前フレームの正規化誤差(PD制御の微分項用)
 
 // ライン検出の1フレーム結果(シリアルに出してライントレースの動作を確認する)
 struct LineResult {
@@ -535,20 +530,17 @@ LineResult lineTrace() {
     r.centroidX = -1;
     r.error     = 0;
     r.outL = r.outR = 0;
-    g_prevNorm  = 0.0f;           // 消失中は微分項をリセット(再検出時の急操舵を防ぐ)
     return r;
   }
 
-  // 3) 誤差 → PD制御で旋回量を算出
+  // 3) 誤差 → P制御で旋回量を算出
   r.detected  = true;
   r.centroidX = (int)(sx / px);
   r.error     = r.centroidX - W / 2;            // 右にずれていれば +
 
   float norm = (float)r.error / (W / 2.0f);     // -1..1
   float aerr = fabsf(norm);                     // 0..1 コーナーの曲率指標(大きいほど急)
-  float dNorm = norm - g_prevNorm;              // 誤差の変化(微分項)。蛇行を制動する
-  g_prevNorm = norm;
-  int   turn = (int)((KP * norm + KD * dNorm) * 100.0f);
+  int   turn = (int)(KP * norm * 100.0f);
   turn = constrain(turn, -MAX_TURN, MAX_TURN);
 
   // コーナー自動減速: 急カーブ(aerr大)ほど基準速度を一時的に落として曲がりやすくする。
