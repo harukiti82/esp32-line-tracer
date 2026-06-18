@@ -76,30 +76,10 @@ void setup() {
 
   String portName = BRIDGE_PORT;
   if (portName.equals("")) {
-    // 自動選択: Mac は同じ機器に /dev/cu.* と /dev/tty.* が並ぶが、双方向通信は cu.* を
-    // 使う(tty.* は着信制御線待ちで "Port busy" になりやすい)。tty.* と Bluetooth を
-    // 除外し、cu.usbmodem / cu.usbserial / cu.wchusbserial を優先して拾う。
-    String[] ports = Serial.list();
-    if (ports.length == 0) {
+    if (Serial.list().length == 0) {
       println("シリアルポートが見つかりません。中継ESP32を接続してください。");
     } else {
-      for (int i = 0; i < ports.length; i++) {
-        String p = ports[i];
-        if (p.startsWith("/dev/tty.")) continue;                 // tty は使わない
-        if (p.toLowerCase().contains("bluetooth")) continue;     // Bluetooth は除外
-        if (p.contains("usbmodem") || p.contains("usbserial") || p.contains("wchusbserial")) {
-          portName = p; break;
-        }
-      }
-      // 候補が無ければ tty 以外の末尾にフォールバック
-      if (portName.equals("")) {
-        for (int i = ports.length - 1; i >= 0; i--) {
-          if (!ports[i].startsWith("/dev/tty.")) { portName = ports[i]; break; }
-        }
-      }
-      if (portName.equals("")) {
-        println("中継機のポートを自動検出できません。BRIDGE_PORT に手動設定してください。");
-      }
+      portName = Serial.list()[Serial.list().length - 1];  // 末尾=直近に挿したもの
     }
   }
   try {
@@ -108,8 +88,7 @@ void setup() {
     println("接続: " + portName + " @" + BAUD);
   } catch (Exception e) {
     println("シリアル接続失敗(" + portName + "): " + e.getMessage());
-    println("対処: (1) Arduino IDEのシリアルモニタを閉じる ← \"Port busy\" の主因");
-    println("      (2) それでも駄目なら BRIDGE_PORT に /dev/cu.usbmodem... を手動設定して再実行");
+    println("BRIDGE_PORT に正しいポート名を設定して再実行してください。");
   }
 }
 
