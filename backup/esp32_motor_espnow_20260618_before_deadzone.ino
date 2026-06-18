@@ -110,10 +110,6 @@ const float CORNER_SLOWDOWN = 0.6f;
 // 蛇行(オーバーシュート)を制動する。0=従来のP制御のみ。大きすぎるとカメラ
 // ノイズに過敏になり逆に震えるので、まず KP の半分前後から現場調整する。
 const float KD = 0.5f;
-// 操舵の不感帯。直線でラインが中央付近(|正規化誤差|<この値)のときは直進扱いにして
-// 操舵を0にし、カメラ重心ノイズへの過剰反応(直線蛇行)を消す。直線では減速もしないので
-// 直線速度は犠牲にしない。大きすぎると緩いカーブの追従が鈍るので小さめから調整する。
-const float STEER_DEADZONE = 0.08f;
 
 const unsigned long PRINT_INTERVAL_MS = 150;  // シリアル出力の間引き間隔
 
@@ -549,9 +545,6 @@ LineResult lineTrace() {
   r.error     = r.centroidX - W / 2;            // 右にずれていれば +
 
   float norm = (float)r.error / (W / 2.0f);     // -1..1
-  // 直線の微小ノイズによる蛇行を抑える不感帯。中央付近は直進扱い(操舵0)にする。
-  // norm=0にすると P項・D項・減速がすべて無効になり、直線を真っ直ぐ最速で走れる。
-  if (fabsf(norm) < STEER_DEADZONE) norm = 0.0f;
   float aerr = fabsf(norm);                     // 0..1 コーナーの曲率指標(大きいほど急)
   float dNorm = norm - g_prevNorm;              // 誤差の変化(微分項)。蛇行を制動する
   g_prevNorm = norm;
