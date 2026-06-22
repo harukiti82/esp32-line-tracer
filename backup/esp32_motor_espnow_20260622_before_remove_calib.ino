@@ -11,9 +11,10 @@
 //    'l' … LINE   算出した左右%で自律走行。基準速度はProcessingからの値で変更可。ライン消失で停止
 //    'r' … REMOTE ESP-NOW中継経由のリモコンで駆動
 //    's' … 即停止して IDLE へ
+//    'c' … CALIB  床と線の輝度を実測してしきい値を自動較正(NVSに保存)
+//    'x' … 較正データを消去して適応しきい値に戻す
+//    'm' … MOTOR  左右モーターのゲイン・中立を較正(車輪を浮かせて実施, NVS保存)
 //  ※どのモードでも検出処理は毎ループ走るので、車輪を回さず検証できる
-//  ※しきい値は適応式(帯平均±LINE_MARGIN)で照明変化に追従する。左右モーターの
-//    個体差補正・床/線の輝度較正といったキャリブレーション機能は撤去済み(定数固定)。
 //  ※起動時オートスタート: バッテリー単体(PCなし)なら数秒のカウントダウン後に
 //    自動でLINEに入る。PCで何かキーを送れば IDLE のまま留まる(カメラNG時もIDLE)。
 //
@@ -26,6 +27,7 @@
 #include <esp_now.h>         // ESP-NOW(コネクションレス。SoftAP/UDPの接続確立が不要)
 #include <esp_wifi.h>        // esp_wifi_set_channel(送受信のチャンネル一致用)
 #include <ESP32Servo.h>
+#include <Preferences.h>     // 較正値を NVS に永続化(ESP32コア同梱、追加インストール不要)
 #include "esp_camera.h"
 
 // ---- ESP-NOW 設定 ----------------------------------------------------------
@@ -121,6 +123,13 @@ const float NORM_FILT_A = 0.5f;
 
 const unsigned long PRINT_INTERVAL_MS = 150;  // シリアル出力の間引き間隔
 
+// ---- キャリブレーション ----------------------------------------------------
+// 'c' で床と線の輝度を実測し、線の明暗としきい値を自動決定して NVS に保存する。
+// 未較正なら従来の適応しきい値(mean±LINE_MARGIN)で動く(後方互換)。
+const int CALIB_SAMPLE_FRAMES = 15;       // 各ステップで平均するフレーム数
+const int CALIB_MIN_SEP       = 25;       // 床と線の輝度差がこれ未満なら較正失敗(保存しない)
+const unsigned long CALIB_KEY_TIMEOUT_MS = 15000;  // キー入力待ちのタイムアウト
+
 // ---- 起動時オートスタート --------------------------------------------------
 // バッテリー単体起動(PCなし)を想定。起動後この秒数の間にシリアル入力が無ければ
 // 自動で LINE(自律走行)に入る。PC接続時は何かキーを送れば IDLE のまま留まる。
@@ -141,6 +150,19 @@ Servo   servoR;
 
 Mode g_mode = MODE_IDLE;                  // 既定は検証用IDLE(車輪を回さない)
 bool g_camOk = false;                     // カメラ初期化成否
+
+// ---- キャリブレーション結果(NVSに永続化) ---------------------------------
+Preferences g_prefs;
+bool g_calibrated    = false;             // 較正済みか(falseなら適応しきい値)
+bool g_calLineIsDark = LINE_IS_DARK;      // 較正で判定した線の明暗
+int  g_threshAbs     = 128;               // 較正で決めた絶対しきい値
+int  g_calFloorLv    = 0;                 // 較正時の床の輝度(参考表示用)
+int  g_calLineLv     = 0;                 // 較正時の線の輝度(参考表示用)
+
+// ---- モーターゲイン較正結果(NVSに永続化) ---------------------------------
+// 左右モーターの個体差を補正する。gain=倍率、mid=中立(停止)パルス幅(us)。
+float g_gainL = 1.0f, g_gainR = 1.0f;     // 左右ゲイン(0.5〜1.5)
+int   g_midL = SERVO_MID_US, g_midR = SERVO_MID_US;  // 左右の中立us
 
 // 現在のモーター出力(%) -100〜100。これが唯一の「真の出力値」。
 int g_leftPercent  = 0;
@@ -165,6 +187,11 @@ struct LineResult {
   int  outL;       // P制御で算出した左出力(%)  ※駆動するかはモード次第
   int  outR;       // P制御で算出した右出力(%)
 };
+
+// ROI帯の輝度統計(平均・最小・最大)。較正で床/線の代表輝度を実測するのに使う。
+// ※Arduinoの自動プロトタイプ生成は最初の関数定義の直前に挿入されるため、
+//   構造体を返す関数より前(=最初の関数より前)で型を定義しておく必要がある。
+struct RoiStat { int mean; int minV; int maxV; };
 
 // ---------------------------------------------------------------------------
 // 指定した左右の出力(%)でモーターを駆動する。
@@ -191,15 +218,233 @@ void setMotorPercent(int leftPct, int rightPct) {
   if (INVERT_L) lSpeed = -lSpeed;
   if (INVERT_R) rSpeed = -rSpeed;
 
-  // 中立(停止)usを基準にパルス化し、ESC許容範囲にクランプする。
-  int lUs = constrain(SERVO_MID_US + lSpeed, SERVO_MIN_US, SERVO_MAX_US);
-  int rUs = constrain(SERVO_MID_US + rSpeed, SERVO_MIN_US, SERVO_MAX_US);
+  // 較正したゲイン(倍率)を反映。左右モーターの個体差を補正して直進性を出す。
+  lSpeed = (int)(lSpeed * g_gainL);
+  rSpeed = (int)(rSpeed * g_gainR);
+
+  // 較正した中立(停止)usを基準にパルス化し、ESC許容範囲にクランプする。
+  int lUs = constrain(g_midL + lSpeed, SERVO_MIN_US, SERVO_MAX_US);
+  int rUs = constrain(g_midR + rSpeed, SERVO_MIN_US, SERVO_MAX_US);
   servoL.writeMicroseconds(lUs);
   servoR.writeMicroseconds(rUs);
 }
 
 void stopMotor() {
   setMotorPercent(0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// キャリブレーション関連
+// ---------------------------------------------------------------------------
+
+// ROI帯の輝度統計を frames フレーム平均で求める(RoiStat は上で定義済み)。
+RoiStat sampleRoiStat(int frames) {
+  long meanAcc = 0, minAcc = 0, maxAcc = 0;
+  int  got = 0;
+  for (int f = 0; f < frames; f++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { delay(20); continue; }
+    const int W = fb->width, H = fb->height;
+    const int rTop = (int)(H * ROI_TOP_R), rBot = (int)(H * ROI_BOT_R);
+    long sum = 0; int cnt = 0, mn = 255, mx = 0;
+    for (int y = rTop; y < rBot; y++) {
+      const uint8_t* row = fb->buf + (long)y * W;
+      for (int x = 0; x < W; x++) {
+        int v = row[x];
+        sum += v; cnt++;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+    }
+    esp_camera_fb_return(fb);
+    if (cnt) { meanAcc += sum / cnt; minAcc += mn; maxAcc += mx; got++; }
+    delay(20);
+  }
+  RoiStat s;
+  if (got) { s.mean = meanAcc / got; s.minV = minAcc / got; s.maxV = maxAcc / got; }
+  else     { s.mean = 128;          s.minV = 0;            s.maxV = 255; }
+  return s;
+}
+
+// シリアルに溜まった入力を捨ててから、1文字入力かタイムアウトまで待つ。
+// 戻り値: キーが押されたら true / タイムアウトなら false。
+bool waitKey(unsigned long timeoutMs) {
+  while (Serial.available()) Serial.read();   // 古い入力を捨てる
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (Serial.available()) { Serial.read(); return true; }
+    delay(10);
+  }
+  return false;
+}
+
+void saveCalibration() {
+  g_prefs.begin("linecal", false);
+  g_prefs.putBool("valid", true);
+  g_prefs.putInt ("thresh", g_threshAbs);
+  g_prefs.putBool("dark",   g_calLineIsDark);
+  g_prefs.putInt ("floor",  g_calFloorLv);
+  g_prefs.putInt ("line",   g_calLineLv);
+  g_prefs.end();
+}
+
+// 起動時に NVS から較正値を読む。無ければ適応しきい値で動く。
+void loadCalibration() {
+  g_prefs.begin("linecal", true);             // 読み取り専用
+  g_calibrated = g_prefs.getBool("valid", false);
+  if (g_calibrated) {
+    g_threshAbs     = g_prefs.getInt ("thresh", 128);
+    g_calLineIsDark = g_prefs.getBool("dark",  LINE_IS_DARK);
+    g_calFloorLv    = g_prefs.getInt ("floor", 0);
+    g_calLineLv     = g_prefs.getInt ("line",  0);
+  }
+  g_prefs.end();
+  if (g_calibrated) {
+    Serial.printf("較正データ読込: %s-line thresh=%d (floor=%d line=%d)\n",
+                  g_calLineIsDark ? "DARK" : "BRIGHT", g_threshAbs, g_calFloorLv, g_calLineLv);
+  } else {
+    Serial.println("較正データなし -> 適応しきい値(mean±LINE_MARGIN)で動作。'c'で較正");
+  }
+}
+
+void clearCalibration() {
+  g_prefs.begin("linecal", false);
+  g_prefs.putBool("valid", false);
+  g_prefs.end();
+  g_calibrated = false;
+  Serial.println(">> 較正データ消去 -> 適応しきい値に戻す");
+}
+
+// 床と線を実測してしきい値・線の明暗を自動決定する2ステップ較正。
+// モーターは停止し、車体を手で持ってカメラを向けながら操作する。
+void runCalibration() {
+  g_mode = MODE_IDLE;
+  stopMotor();
+  if (!g_camOk) { Serial.println("カメラNGのため較正できません"); return; }
+
+  Serial.println("=== キャリブレーション ===");
+  Serial.println("[1/2] カメラを『床だけ(線なし)』に向けて任意キー (15秒で中止)");
+  if (!waitKey(CALIB_KEY_TIMEOUT_MS)) { Serial.println("タイムアウトで中止(較正は変更なし)"); return; }
+  RoiStat fl = sampleRoiStat(CALIB_SAMPLE_FRAMES);
+  Serial.printf("  床   : mean=%d (min=%d max=%d)\n", fl.mean, fl.minV, fl.maxV);
+
+  Serial.println("[2/2] カメラを『線の上』に向けて任意キー");
+  if (!waitKey(CALIB_KEY_TIMEOUT_MS)) { Serial.println("タイムアウトで中止(較正は変更なし)"); return; }
+  RoiStat ln = sampleRoiStat(CALIB_SAMPLE_FRAMES);
+  Serial.printf("  線上 : mean=%d (min=%d max=%d)\n", ln.mean, ln.minV, ln.maxV);
+
+  // 床の代表輝度を基準に、線が「暗い側」か「明るい側」かを実測で判定する。
+  // 線が細くてもROIの min/max が線画素を拾うので、平均より頑健に明暗を見分けられる。
+  int floorLv       = fl.mean;
+  int darkContrast  = floorLv - ln.minV;      // 暗い線ならここが大きい
+  int brightContrast = ln.maxV - floorLv;     // 明るい線ならここが大きい
+  bool lineIsDark   = (darkContrast >= brightContrast);
+  int  lineLv       = lineIsDark ? ln.minV : ln.maxV;
+  int  sep          = abs(floorLv - lineLv);
+
+  if (sep < CALIB_MIN_SEP) {
+    Serial.printf("コントラスト不足(差=%d < %d)。照明や対象を見直して再実行(c)\n", sep, CALIB_MIN_SEP);
+    return;                                    // 保存しない(既存設定を維持)
+  }
+
+  g_calLineIsDark = lineIsDark;
+  g_threshAbs     = (floorLv + lineLv) / 2;    // 床と線の中間を絶対しきい値に
+  g_calFloorLv    = floorLv;
+  g_calLineLv     = lineLv;
+  g_calibrated    = true;
+  saveCalibration();
+  Serial.printf(">> 較正完了: %s-line floor=%d line=%d thresh=%d (NVS保存済)\n",
+                lineIsDark ? "DARK" : "BRIGHT", floorLv, lineLv, g_threshAbs);
+}
+
+// ---------------------------------------------------------------------------
+// モーターゲイン較正(左右バランス＋中立トリム)
+// ---------------------------------------------------------------------------
+void saveMotorCal() {
+  g_prefs.begin("motorcal", false);
+  g_prefs.putBool ("valid", true);
+  g_prefs.putFloat("gainL", g_gainL);
+  g_prefs.putFloat("gainR", g_gainR);
+  g_prefs.putInt  ("midL",  g_midL);
+  g_prefs.putInt  ("midR",  g_midR);
+  g_prefs.end();
+}
+
+// 起動時にNVSからモーター較正値を読む。無ければ既定(ゲイン1.0/中立1500)。
+void loadMotorCal() {
+  g_prefs.begin("motorcal", true);
+  bool valid = g_prefs.getBool("valid", false);
+  if (valid) {
+    g_gainL = g_prefs.getFloat("gainL", 1.0f);
+    g_gainR = g_prefs.getFloat("gainR", 1.0f);
+    g_midL  = g_prefs.getInt  ("midL",  SERVO_MID_US);
+    g_midR  = g_prefs.getInt  ("midR",  SERVO_MID_US);
+  }
+  g_prefs.end();
+  Serial.printf("モーター較正%s: gainL=%.2f gainR=%.2f midL=%dus midR=%dus\n",
+                valid ? "読込" : "(既定)", g_gainL, g_gainR, g_midL, g_midR);
+}
+
+void printMotorCal(int testPct) {
+  Serial.printf("  gainL=%.2f gainR=%.2f  midL=%dus midR=%dus  test=%+d%%\n",
+                g_gainL, g_gainR, g_midL, g_midR, testPct);
+}
+
+// 車輪を浮かせた状態で左右バランス・中立をライブ調整して NVS に保存する。
+// w/s:両輪テスト速度 / space:停止 / a,d:左右バランス /
+// j,k:左中立-+ / n,m:右中立-+ (左右独立。0%で各輪が止まるよう個別に合わせる) /
+// r:既定に戻す / p:現在値 / v:保存して終了 / q:破棄して終了
+// ※Arduinoシリアルモニタは改行でまとめて送るため、改行(\r\n)は無視扱いにして
+//   保存は明示キー'v'にしている(改行あり/なしどちらの設定でも単キー操作が壊れない)。
+void runMotorCalibration() {
+  g_mode = MODE_IDLE;
+  Serial.println("=== モーターゲイン較正 (車輪を浮かせて実施) ===");
+  Serial.println(" w/s:両輪テスト速度+- / space:停止 / a:左を強く d:右を強く");
+  Serial.println(" j/k:左中立-+ / n/m:右中立-+ / r:既定 / p:現在値 / v:保存 / q:破棄");
+
+  // 破棄に備えて開始時の値を退避
+  float bkGainL = g_gainL, bkGainR = g_gainR;
+  int   bkMidL  = g_midL,  bkMidR  = g_midR;
+  int   testPct = 0;
+
+  stopMotor();
+  printMotorCal(testPct);
+
+  while (true) {
+    if (!Serial.available()) { delay(10); continue; }
+    int c = Serial.read();
+    switch (c) {
+      case 'w': testPct = constrain(testPct + 5, -100, 100); break;
+      case 's': testPct = constrain(testPct - 5, -100, 100); break;
+      case ' ': testPct = 0; break;
+      case 'd': g_gainR = constrain(g_gainR + 0.02f, 0.5f, 1.5f);
+                g_gainL = constrain(g_gainL - 0.02f, 0.5f, 1.5f); break;  // 右を強く
+      case 'a': g_gainL = constrain(g_gainL + 0.02f, 0.5f, 1.5f);
+                g_gainR = constrain(g_gainR - 0.02f, 0.5f, 1.5f); break;  // 左を強く
+      case 'j': g_midL = constrain(g_midL - 2, 1400, 1600); break;       // 左中立 -
+      case 'k': g_midL = constrain(g_midL + 2, 1400, 1600); break;       // 左中立 +
+      case 'n': g_midR = constrain(g_midR - 2, 1400, 1600); break;       // 右中立 -
+      case 'm': g_midR = constrain(g_midR + 2, 1400, 1600); break;       // 右中立 +
+      case 'r': g_gainL = g_gainR = 1.0f; g_midL = g_midR = SERVO_MID_US;
+                testPct = 0; Serial.println("  既定に戻した"); break;
+      case 'p': break;                                  // 現在値を表示するだけ
+      case 'v':                                         // 保存して終了
+        testPct = 0; stopMotor();
+        saveMotorCal();
+        Serial.println(">> モーター較正を保存して終了 (NVS)");
+        return;
+      case 'q':                                         // 破棄して終了
+        g_gainL = bkGainL; g_gainR = bkGainR; g_midL = bkMidL; g_midR = bkMidR;
+        testPct = 0; stopMotor();
+        Serial.println(">> 破棄して終了 (変更前に戻した)");
+        return;
+      case '\r': case '\n': continue;                   // 改行は無視
+      default: continue;                                // その他キーは無視
+    }
+    // 変更を即反映: 両輪同%で駆動して直進性/停止を確認(現在のゲイン・中立が乗る)
+    setMotorPercent(testPct, testPct);
+    printMotorCal(testPct);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,8 +522,11 @@ LineResult lineTrace() {
   int mean = cnt ? (int)(sum / cnt) : 128;
   r.bandMean = mean;
 
-  // 帯平均から LINE_MARGIN だけ離れた画素を線とみなす(照明変化に追従する適応しきい値)。
-  int thresh = LINE_IS_DARK ? (mean - LINE_MARGIN) : (mean + LINE_MARGIN);
+  // 較正済みなら実測した絶対しきい値を使う。未較正なら従来の適応しきい値。
+  bool lineIsDark = g_calibrated ? g_calLineIsDark : LINE_IS_DARK;
+  int  thresh     = g_calibrated ? g_threshAbs
+                                 : (LINE_IS_DARK ? (mean - LINE_MARGIN)
+                                                 : (mean + LINE_MARGIN));
 
   // 2) しきい値を超える(=線)画素の重心Xを求める
   long sx = 0;
@@ -286,7 +534,7 @@ LineResult lineTrace() {
   for (int y = rTop; y < rBot; y++) {
     const uint8_t* row = fb->buf + (long)y * W;
     for (int x = 0; x < W; x++) {
-      bool isLine = LINE_IS_DARK ? (row[x] < thresh) : (row[x] > thresh);
+      bool isLine = lineIsDark ? (row[x] < thresh) : (row[x] > thresh);
       if (isLine) { sx += x; px++; }
     }
   }
@@ -351,15 +599,20 @@ void printTelemetry(const LineResult& r) {
                       :                           "REMOTE";
   bool driving = (g_mode == MODE_LINE && r.detected);
 
+  // 較正の有効/無効を表示(較正済みは線の明暗と絶対しきい値も出す)
+  char calStr[24];
+  if (g_calibrated) snprintf(calStr, sizeof(calStr), "cal=%s@%d", g_calLineIsDark ? "DARK" : "BRT", g_threshAbs);
+  else              snprintf(calStr, sizeof(calStr), "cal=off");
+
   if (!g_camOk) {
     Serial.printf("[LINE] camera=NG  mode=%s\n", modeStr);
   } else if (r.detected) {
-    Serial.printf("[LINE] det=Y mean=%3d cx=%3d/%d err=%+4d px=%4d base=%3d%% -> L=%+4d%% R=%+4d%% | mode=%s%s\n",
+    Serial.printf("[LINE] det=Y mean=%3d cx=%3d/%d err=%+4d px=%4d base=%3d%% -> L=%+4d%% R=%+4d%% | %s mode=%s%s\n",
                   r.bandMean, r.centroidX, r.width, r.error, r.pixels, g_baseSpeed,
-                  r.outL, r.outR, modeStr, driving ? " (駆動中)" : " (出力のみ)");
+                  r.outL, r.outR, calStr, modeStr, driving ? " (駆動中)" : " (出力のみ)");
   } else {
-    Serial.printf("[LINE] det=N mean=%3d px=%4d -- ライン消失 -- | mode=%s%s\n",
-                  r.bandMean, r.pixels, modeStr,
+    Serial.printf("[LINE] det=N mean=%3d px=%4d -- ライン消失 -- | %s mode=%s%s\n",
+                  r.bandMean, r.pixels, calStr, modeStr,
                   (g_mode == MODE_LINE) ? " -> 停止" : "");
   }
 }
@@ -374,6 +627,9 @@ void handleSerialCmd() {
       case 'r': g_mode = MODE_REMOTE; stopMotor(); g_lastCmdMs = millis();
                 Serial.println(">> モード: REMOTE (ESP-NOWリモコン)"); break;
       case 's': g_mode = MODE_IDLE;   stopMotor(); Serial.println(">> 停止 (IDLEへ)");                 break;
+      case 'c': runCalibration();     break;           // 床/線を実測して較正
+      case 'x': clearCalibration();   break;           // 較正データを消去
+      case 'm': runMotorCalibration(); break;          // モーターゲイン較正
       default: break;                                  // 改行など無視
     }
   }
@@ -458,12 +714,15 @@ void setup() {
   stopMotor();                          // 起動時は必ず停止
 
   g_camOk = setupCamera();              // カメラ初期化(失敗してもリモコンは使える)
-  stopMotor();                          // 中立usを即反映して停止
+  loadCalibration();                    // NVSから較正値を復元(無ければ適応しきい値)
+  loadMotorCal();                       // NVSからモーター較正(ゲイン/中立)を復元
+  stopMotor();                          // 較正した中立usを即反映して停止
 
   setupEspNow();
 
   Serial.println("------------------------------------------------------------");
   Serial.println("操作: i=IDLE(検証) / l=LINE(自律) / r=REMOTE(ESP-NOW) / s=停止");
+  Serial.println("      c=較正(床→線を撮る) / x=較正消去 / m=モーターゲイン較正");
   Serial.println("------------------------------------------------------------");
 
   bootAutoStart();                      // PCなしなら数秒後にLINE自動開始(キーで中止)
