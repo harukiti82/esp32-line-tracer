@@ -43,6 +43,7 @@
 3. うまくいかない時の目安（ファーム冒頭の定数）
    - 線を拾わない / `det=N` が多い → `LINE_MARGIN` を下げる
    - 影や外光を線と誤検出する → `LINE_MARGIN` を上げる、`LOCAL_BG_R` を広げる（局所平均の横幅を大きく）
-   - カーブで外れる → `CORNER_MAX_SPEED` を下げる（コーナー速度上限）、`CORNER_SLOWDOWN` を上げる、`KP` を上げる
-   - 高速(240BPM等)で曲がりきれない → まず `CORNER_MAX_SPEED` を下げて確実に減速させる
+   - カーブで外れる → `CORNER_MAX_SPEED` を下げる（コーナー速度上限）、`ROI_TOP_R` を下げて先読みを強める、`KP` を上げる
+   - 高速(240BPM等)で曲がりきれない → `CORNER_MAX_SPEED` を下げる＋`ROI_TOP_R` を下げて早めにカーブを捉える
+   - 急カーブで止まる → 減速しすぎ。`CORNER_MIN_SPEED` を上げる（下限速度）、`CORNER_SLOWDOWN` を下げる
    - 直線でフラつく → `KP` を下げる
